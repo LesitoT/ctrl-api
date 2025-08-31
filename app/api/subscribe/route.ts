@@ -1,31 +1,70 @@
 // app/api/subscribe/route.ts
 import { NextRequest } from 'next/server';
 
+// Force Node.js runtime so process.env is available (not Edge)
+export const runtime = 'nodejs';
+// Ensure this API route is always dynamic (no static optimisation)
+export const dynamic = 'force-dynamic';
+
 type SubscribeOk = { ok: true };
 type SubscribeErr = { ok: false; message: string; errors?: unknown };
 
-export async function OPTIONS() {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      'Access-Control-Allow-Origin': process.env.CORS_ALLOW_ORIGIN || '',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-      'Access-Control-Max-Age': '86400',
-    },
-  });
+function parseAllowedOrigins(): string[] {
+  const raw = process.env.CORS_ALLOW_ORIGIN?.trim() || '';
+  // Support comma- or space-separated list
+  return raw ? raw.split(/[,\s]+/).filter(Boolean) : [];
+}
+
+function pickCorsOrigin(req: NextRequest, allowList: string[]): string | '' {
+  const reqOrigin = req.headers.get('origin') || '';
+  if (!allowList.length) return '';
+  if (allowList.includes('*')) return '*';
+  return allowList.includes(reqOrigin) ? reqOrigin : '';
+}
+
+function corsJson<T>(body: T, status: number, origin: string) {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (origin) {
+    headers['Access-Control-Allow-Origin'] = origin;
+    headers['Vary'] = 'Origin';
+  }
+  return new Response(JSON.stringify(body), { status, headers });
+}
+
+export async function OPTIONS(req: NextRequest) {
+  const allowList = parseAllowedOrigins();
+  const origin = pickCorsOrigin(req, allowList);
+  const headers: Record<string, string> = {
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '86400',
+  };
+  if (origin) {
+    headers['Access-Control-Allow-Origin'] = origin;
+    headers['Vary'] = 'Origin';
+  }
+  return new Response(null, { status: 204, headers });
 }
 
 export async function POST(req: NextRequest) {
-  try {
-    const body = (await req.json().catch(() => ({}))) as Partial<{ email: string }>;
-    const email = typeof body.email === 'string' ? body.email : '';
+  const allowList = parseAllowedOrigins();
+  const origin = pickCorsOrigin(req, allowList);
 
+  try {
+    // Body + validation
+    const body = (await req.json().catch(() => ({}))) as Partial<{ email: string }>;
+    const email = typeof body.email === 'string' ? body.email.trim() : '';
     const validEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
     if (!validEmail) {
-      return withCors(json<SubscribeErr>({ ok: false, message: 'Please enter a valid email address.' }, 422));
+      return corsJson<SubscribeErr>(
+        { ok: false, message: 'Please enter a valid email address.' },
+        422,
+        origin
+      );
     }
 
+    // MailerLite call
     const r = await fetch('https://connect.mailerlite.com/api/subscribers', {
       method: 'POST',
       headers: {
@@ -42,31 +81,19 @@ export async function POST(req: NextRequest) {
     const data = (await r.json().catch(() => null)) as { message?: string; errors?: unknown } | null;
 
     if (!r.ok) {
-      return withCors(
-        json<SubscribeErr>(
-          { ok: false, message: data?.message || 'Signup failed', errors: data?.errors },
-          r.status,
-        ),
+      return corsJson<SubscribeErr>(
+        { ok: false, message: data?.message || 'Signup failed', errors: data?.errors },
+        r.status,
+        origin
       );
     }
 
-    return withCors(json<SubscribeOk>({ ok: true }, 200));
+    return corsJson<SubscribeOk>({ ok: true }, 200, origin);
   } catch {
-    return withCors(json<SubscribeErr>({ ok: false, message: 'Server error. Please try again.' }, 500));
+    return corsJson<SubscribeErr>(
+      { ok: false, message: 'Server error. Please try again.' },
+      500,
+      origin
+    );
   }
-}
-
-function json<T>(body: T, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
-
-function withCors(res: Response) {
-  const allow = process.env.CORS_ALLOW_ORIGIN || '';
-  const h = new Headers(res.headers);
-  h.set('Access-Control-Allow-Origin', allow);
-  h.set('Vary', 'Origin');
-  return new Response(res.body, { status: res.status, headers: h });
 }
