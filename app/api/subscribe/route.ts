@@ -22,8 +22,12 @@ function pickCorsOrigin(req: NextRequest, allowList: string[]): string | '' {
   return allowList.includes(reqOrigin) ? reqOrigin : '';
 }
 
+// Include explicit no-store headers to prevent caching
 function corsJson<T>(body: T, status: number, origin: string) {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store',
+  };
   if (origin) {
     headers['Access-Control-Allow-Origin'] = origin;
     headers['Vary'] = 'Origin';
@@ -51,11 +55,33 @@ export async function POST(req: NextRequest) {
   const origin = pickCorsOrigin(req, allowList);
 
   try {
-    // Body + validation
-    const body = (await req.json().catch(() => ({}))) as Partial<{ email: string }>;
-    const email = typeof body.email === 'string' ? body.email.trim() : '';
-    const validEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    // Guard against missing API key
+    if (!process.env.MAILERLITE_API_KEY) {
+      return corsJson<SubscribeErr>(
+        { ok: false, message: 'Server configuration error (missing API key).' },
+        500,
+        origin
+      );
+    }
 
+    // Parse body
+    const body = (await req.json().catch(() => ({}))) as Partial<{
+      email: string;
+      name: string;
+      company: string;
+      phone: string;
+      reason: string;
+    }>;
+
+    const email = typeof body.email === 'string' ? body.email.trim() : '';
+    const name = (body.name ?? '').toString().trim();
+    const company = (body.company ?? '').toString().trim();
+    const phone = (body.phone ?? '').toString().trim();
+    let reason = (body.reason ?? '').toString().trim();
+    if (reason.length > 280) reason = reason.slice(0, 280);
+
+    // Validate email
+    const validEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
     if (!validEmail) {
       return corsJson<SubscribeErr>(
         { ok: false, message: 'Please enter a valid email address.' },
@@ -64,7 +90,18 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // MailerLite call
+    // Build fields map only with provided values
+    const fields: Record<string, string> = {};
+    if (name) fields.name = name;          // default field
+    if (company) fields.company = company; // custom
+
+    // Phone sanitisation: allow only digits, +, spaces, -, ()
+    const phoneClean = phone.replace(/[^\d+ \-()]/g, '');
+    if (phoneClean) fields.phone = phoneClean;
+
+    if (reason) fields.reason = reason;    // custom
+
+    // Upsert subscriber to MailerLite
     const r = await fetch('https://connect.mailerlite.com/api/subscribers', {
       method: 'POST',
       headers: {
@@ -74,11 +111,15 @@ export async function POST(req: NextRequest) {
       },
       body: JSON.stringify({
         email,
+        ...(Object.keys(fields).length ? { fields } : {}),
         groups: ['164263897807717645'], // WaitlistLp group
       }),
     });
 
-    const data = (await r.json().catch(() => null)) as { message?: string; errors?: unknown } | null;
+    const data = (await r.json().catch(() => null)) as {
+      message?: string;
+      errors?: unknown;
+    } | null;
 
     if (!r.ok) {
       return corsJson<SubscribeErr>(
